@@ -72,6 +72,7 @@ export default function (pi: ExtensionAPI) {
   const workspaceDir = process.cwd();
   let runtimeEnabledOverride: boolean | undefined;
   let runtimeReadOnlyOverride: boolean | undefined;
+  let runtimeUserShellOverride: boolean | undefined;
   const warnedUnavailableProviders = new Set<string>();
 
   pi.registerFlag("sandbox", {
@@ -89,6 +90,11 @@ export default function (pi: ExtensionAPI) {
     type: "boolean",
     default: false,
   });
+  pi.registerFlag("sandbox-user-shell", {
+    description: "Also sandbox user-typed !/!! shell commands for this Pi process",
+    type: "boolean",
+    default: false,
+  });
 
   function syncStartupOverrides() {
     const resolved = resolveStartupOverrides(
@@ -98,6 +104,7 @@ export default function (pi: ExtensionAPI) {
     );
     runtimeEnabledOverride = resolved.runtimeEnabledOverride;
     runtimeReadOnlyOverride = resolved.runtimeReadOnlyOverride;
+    runtimeUserShellOverride = pi.getFlag("sandbox-user-shell") === true ? true : undefined;
     for (const warning of resolved.warnings) {
       console.warn(warning);
     }
@@ -279,6 +286,15 @@ export default function (pi: ExtensionAPI) {
   // ── User bash guard (user-typed !commands) ──────────────────────────────
 
   pi.on("user_bash", (_event, _ctx) => {
+    const { config, enabled } = getState();
+    const sandboxUserShell = runtimeUserShellOverride ?? config.sandboxUserShell ?? false;
+
+    // User-typed commands are trusted: unless sandboxUserShell is enabled, let
+    // Pi run them with its own local (unsandboxed) operations.
+    if (!enabled || !sandboxUserShell) {
+      return;
+    }
+
     return {
       operations: dynamicOps,
     };
@@ -298,6 +314,7 @@ export default function (pi: ExtensionAPI) {
         `Provider:     ${activeProvider.name}${enabled && activeProvider.name === "none" ? " (unavailable)" : ""}`,
         `Read-only:    ${config.readOnly ? "yes" : "no"}`,
         `Network:      ${config.network ? "allowed" : "blocked"}`,
+        `User shell:   ${(runtimeUserShellOverride ?? config.sandboxUserShell) ? "sandboxed" : "unsandboxed"}`,
         `Writable:`,
         ...(config.writable.length > 0 ? config.writable.map((p) => `  - ${p}`) : ["  - none"]),
       ];
@@ -349,6 +366,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       runtimeEnabledOverride = undefined;
       runtimeReadOnlyOverride = undefined;
+      runtimeUserShellOverride = undefined;
       syncStartupOverrides();
       ctx.ui.notify("pi-sandbox overrides cleared; using config again", "info");
     },

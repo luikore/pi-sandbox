@@ -90,6 +90,7 @@ export function loadConfig(workspaceDir: string): { config: SandboxConfig; pathR
       denyWithin: mergeDenyWithin(raw.denyWithin, pathResolver),
       network: raw.network ?? true,
       provider: resolveProvider(raw.provider),
+      sandboxUserShell: resolveSandboxUserShell(raw.sandboxUserShell),
     },
     pathResolver,
   };
@@ -187,6 +188,16 @@ export function resolveEnabled(raw: unknown): boolean {
     console.warn(`[pi-sandbox] Invalid enabled value "${String(raw)}", falling back to true`);
   }
   return true;
+}
+
+export function resolveSandboxUserShell(raw: unknown): boolean {
+  if (typeof raw === "boolean") {
+    return raw;
+  }
+  if (raw !== undefined) {
+    console.warn(`[pi-sandbox] Invalid sandboxUserShell value "${String(raw)}", falling back to false`);
+  }
+  return false;
 }
 
 export function resolveReadOnly(raw: unknown): boolean {

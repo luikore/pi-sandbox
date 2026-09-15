@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig, getProtectedConfigPaths, getRequiredWritablePaths, resolveEnabled, resolveReadOnly, computeEffectiveDenyRead } from "./config.ts";
+import { loadConfig, getProtectedConfigPaths, getRequiredWritablePaths, resolveEnabled, resolveReadOnly, resolveSandboxUserShell, computeEffectiveDenyRead } from "./config.ts";
 import { isPathAllowed, resolveRealPath } from "./guard.ts";
 
 describe("resolveEnabled", () => {
@@ -22,6 +22,22 @@ describe("resolveReadOnly", () => {
   it("accepts explicit booleans", () => {
     assert.equal(resolveReadOnly(true), true);
     assert.equal(resolveReadOnly(false), false);
+  });
+});
+
+describe("resolveSandboxUserShell", () => {
+  it("defaults to false so user-typed ! commands run unsandboxed", () => {
+    assert.equal(resolveSandboxUserShell(undefined), false);
+  });
+
+  it("accepts explicit booleans", () => {
+    assert.equal(resolveSandboxUserShell(true), true);
+    assert.equal(resolveSandboxUserShell(false), false);
+  });
+
+  it("falls back to false for invalid values", () => {
+    assert.equal(resolveSandboxUserShell("yes"), false);
+    assert.equal(resolveSandboxUserShell(1), false);
   });
 });
 

@@ -210,6 +210,30 @@ describe("isPathAllowed", () => {
     assert.equal(isPathSearchable("/workspace", c), true);
   });
 
+  it("blocks grep/find from the filesystem root when denyRead is non-empty", () => {
+    const c: SandboxConfig = {
+      enabled: true,
+      readOnly: false,
+      denyRead: [`${homedir()}/.ssh`, "/etc/passwd"],
+      writable: ["/workspace"],
+      denyWithin: [],
+      network: true,
+    };
+    assert.equal(isPathSearchable("/", c), false);
+  });
+
+  it("allows grep/find from the filesystem root when nothing is denied", () => {
+    const c: SandboxConfig = {
+      enabled: true,
+      readOnly: false,
+      denyRead: [],
+      writable: ["/workspace"],
+      denyWithin: [],
+      network: true,
+    };
+    assert.equal(isPathSearchable("/", c), true);
+  });
+
   it("allowRead child path wins over a broader denyRead (most-specific-wins)", () => {
     const c: SandboxConfig = {
       enabled: true,

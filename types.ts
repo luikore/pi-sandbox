@@ -17,6 +17,13 @@ export interface SandboxConfig {
   network: boolean;
   /** Force a specific provider: "auto" | "sandbox-exec" | "bubblewrap" | "none". Default: "auto". */
   provider?: SandboxProviderType;
+  /**
+   * When true, user-typed `!`/`!!` shell commands are run inside the sandbox
+   * like the agent's bash tool. When false (default), user commands run with
+   * Pi's normal local shell backend and are not sandboxed, because they are
+   * explicitly issued by the human rather than the model.
+   */
+  sandboxUserShell?: boolean;
 }
 
 export type SandboxProviderType = "auto" | "sandbox-exec" | "bubblewrap" | "none";

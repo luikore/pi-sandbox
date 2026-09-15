@@ -51,6 +51,7 @@ Supported fields:
 - `denyWithin`: subpaths that stay blocked even if they are inside a writable directory
 - `network`: whether outbound network access is allowed
 - `provider`: `auto`, `sandbox-exec`, `bubblewrap`, or `none`
+- `sandboxUserShell`: also run user-typed `!`/`!!` commands inside the sandbox (default: `false`)
 
 Example:
 
@@ -62,7 +63,8 @@ Example:
   "writable": ["${WORKSPACE}", "${TMP}"],
   "denyWithin": ["${WORKSPACE}/.git/hooks"],
   "network": true,
-  "provider": "auto"
+  "provider": "auto",
+  "sandboxUserShell": false
 }
 ```
 
@@ -117,11 +119,21 @@ Runtime controls:
 /sandbox-reset
 ```
 
+### User-typed `!` commands
+
+By default, commands you type yourself with `!`/`!!` run through Pi's normal local
+shell backend and are **not** sandboxed — they are explicitly initiated by you, not
+the model. The agent's bash tool stays sandboxed either way.
+
+Set `sandboxUserShell: true` in `sandbox.json` (or pass `--sandbox-user-shell`) to
+route `!` commands through the sandbox as well.
+
 Startup flags:
 
 ```bash
 pi -e ./index.ts --sandbox
 pi -e ./index.ts --sandbox-readonly
+pi -e ./index.ts --sandbox-user-shell
 pi -e ./index.ts --no-sandbox
 ```
 

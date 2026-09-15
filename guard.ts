@@ -97,10 +97,13 @@ export function isPathSearchable(absolutePath: string, config: SandboxConfig): b
   if (denyLen >= 0 && (allowLen < 0 || denyLen >= allowLen)) return false;
 
   // Even when the path itself is allowed, block if it would traverse a denied
-  // descendant that isn't covered by a more-specific allowRead.
+  // descendant that isn't covered by a more-specific allowRead. The prefix must
+  // be "/" (not "//") when the path is the filesystem root, otherwise root
+  // escapes this check and `find`/`grep` from "/" bypass denyRead entirely.
+  const descendantPrefix = normPath === "/" ? "/" : normPath + "/";
   for (const denied of config.denyRead) {
     const d = stripTrailingSep(resolve(denied));
-    if (d.startsWith(normPath + "/")) {
+    if (d.startsWith(descendantPrefix)) {
       const dAllowLen = longestMatchingPrefix(d, allowRead);
       const dDenyLen = longestMatchingPrefix(d, config.denyRead);
       const effectivelyAllowed = dAllowLen >= 0 && (dDenyLen < 0 || dAllowLen > dDenyLen);

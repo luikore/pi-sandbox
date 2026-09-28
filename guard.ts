@@ -2,6 +2,7 @@ import { realpathSync } from "node:fs";
 import { resolve, dirname, basename, join } from "node:path";
 import { homedir } from "node:os";
 import type { SandboxConfig } from "./types.ts";
+import { pathMatches } from "./glob.ts";
 
 export function resolveRealPath(targetPath: string): string {
   try {
@@ -37,84 +38,43 @@ export function resolveToolPath(cwd: string, targetPath: string): string {
   return resolve(cwd, expandHomePath(targetPath));
 }
 
-function isPathWithinRoots(absolutePath: string, allowedRoots: string[], deniedRoots: string[]): boolean {
-  const normPath = stripTrailingSep(resolve(absolutePath));
-  for (const denied of deniedRoots) {
-    const d = stripTrailingSep(resolve(denied));
-    if (normPath === d || normPath.startsWith(d + "/")) {
-      return false;
-    }
-  }
-  for (const allowed of allowedRoots) {
-    const a = stripTrailingSep(resolve(allowed));
-    if (normPath === a || normPath.startsWith(a + "/")) {
-      return true;
-    }
-  }
-  return false;
-}
-
-export function isPathDenied(absolutePath: string, deniedRoots: string[]): boolean {
-  const normPath = stripTrailingSep(resolve(absolutePath));
-  for (const denied of deniedRoots) {
-    const d = stripTrailingSep(resolve(denied));
-    if (normPath === d || normPath.startsWith(d + "/")) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function longestMatchingPrefix(absolutePath: string, roots: string[]): number {
-  const normPath = stripTrailingSep(resolve(absolutePath));
-  let best = -1;
-  for (const root of roots) {
-    const nr = stripTrailingSep(resolve(root));
-    if ((normPath === nr || normPath.startsWith(nr + "/")) && nr.length > best) {
-      best = nr.length;
-    }
-  }
-  return best;
+/** First entry (literal path or glob) that equals or contains absolutePath. */
+export function findMatch(absolutePath: string, entries: string[]): string | undefined {
+  const p = resolve(absolutePath);
+  return entries.find((e) => pathMatches(p, e));
 }
 
 export function isPathReadable(absolutePath: string, config: SandboxConfig): boolean {
-  const allowLen = longestMatchingPrefix(absolutePath, config.allowRead ?? []);
-  const denyLen = longestMatchingPrefix(absolutePath, config.denyRead);
-  if (allowLen >= 0 && denyLen >= 0) return allowLen > denyLen;
-  if (allowLen >= 0) return true;
-  if (denyLen >= 0) return false;
-  return true;
+  return findMatch(absolutePath, config.deny) === undefined;
 }
 
-export function isPathSearchable(absolutePath: string, config: SandboxConfig): boolean {
-  const normPath = stripTrailingSep(resolve(absolutePath));
-  const allowRead = config.allowRead ?? [];
-
-  const allowLen = longestMatchingPrefix(absolutePath, allowRead);
-  const denyLen = longestMatchingPrefix(absolutePath, config.denyRead);
-
-  // If the path itself is denied and allow doesn't win, block immediately.
-  if (denyLen >= 0 && (allowLen < 0 || denyLen >= allowLen)) return false;
-
-  // Even when the path itself is allowed, block if it would traverse a denied
-  // descendant that isn't covered by a more-specific allowRead. The prefix must
-  // be "/" (not "//") when the path is the filesystem root, otherwise root
-  // escapes this check and `find`/`grep` from "/" bypass denyRead entirely.
-  const descendantPrefix = normPath === "/" ? "/" : normPath + "/";
-  for (const denied of config.denyRead) {
-    const d = stripTrailingSep(resolve(denied));
-    if (d.startsWith(descendantPrefix)) {
-      const dAllowLen = longestMatchingPrefix(d, allowRead);
-      const dDenyLen = longestMatchingPrefix(d, config.denyRead);
-      const effectivelyAllowed = dAllowLen >= 0 && (dDenyLen < 0 || dAllowLen > dDenyLen);
-      if (!effectivelyAllowed) return false;
-    }
-  }
-
-  return true;
+export function isPathWritable(absolutePath: string, config: SandboxConfig): boolean {
+  if (findMatch(absolutePath, config.deny) || findMatch(absolutePath, config.denyWrite)) return false;
+  return findMatch(absolutePath, config.writable) !== undefined;
 }
 
-export function isPathAllowed(absolutePath: string, config: SandboxConfig): boolean {
-  if (config.readOnly) return false;
-  return isPathWithinRoots(absolutePath, config.writable, config.denyWithin);
+/** Candidate file paths in a grep output line (`path:12: text` or `path-12- text`). */
+function grepLinePaths(line: string): string[] {
+  return [...line.matchAll(/[:-]\d+[:-] /g)].map((m) => line.slice(0, m.index));
+}
+
+/**
+ * Drop grep/find/ls output lines that reference denied paths. Lines are paths relative to `root`.
+ * Returns the filtered text and the number of hidden lines.
+ */
+export function filterSearchOutput(
+  text: string,
+  root: string,
+  tool: "grep" | "find" | "ls",
+  config: SandboxConfig,
+): { text: string; hidden: number } {
+  let hidden = 0;
+  const kept = text.split("\n").filter((line) => {
+    if (!line) return true;
+    const candidates = tool === "grep" ? grepLinePaths(line) : [line];
+    const denied = candidates.some((c) => !isPathReadable(resolve(root, c), config));
+    if (denied) hidden++;
+    return !denied;
+  });
+  return { text: kept.join("\n"), hidden };
 }

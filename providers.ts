@@ -3,8 +3,9 @@ import { spawn } from "node:child_process";
 import { resolve as pathResolve, join } from "node:path";
 import { platform, tmpdir } from "node:os";
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import type { SandboxProvider, SandboxConfig, SandboxProviderType } from "./types.ts";
+import type { SandboxProvider, SandboxConfig } from "./types.ts";
 import { stripTrailingSep } from "./guard.ts";
+import { expandGlob, globToSubtreeRegexSource, isGlob } from "./glob.ts";
 
 function findBinary(name: string): boolean {
   const pathDirs = (process.env.PATH ?? "").split(":").filter(Boolean);
@@ -28,7 +29,7 @@ class SandboxExecProvider implements SandboxProvider {
   }
 
   wrap(inner: BashOperations, _cwd: string, config: SandboxConfig): BashOperations {
-    const key = JSON.stringify([config.readOnly, config.network, config.writable, config.denyRead, config.denyWithin, config.allowRead]);
+    const key = JSON.stringify([config.allowNetwork, config.writable, config.deny, config.denyWrite]);
     let profile = this._profileCache.get(key);
     if (!profile) {
       profile = buildSandboxExecProfile(config);
@@ -45,8 +46,16 @@ class SandboxExecProvider implements SandboxProvider {
 
 }
 
-function escapeSbplPath(path: string): string {
-  return path.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+function escapeSbpl(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+/** SBPL filter for a path (itself + subtree) or glob. */
+function sbplFilter(p: string): string {
+  if (!isGlob(p)) return `(subpath "${escapeSbpl(p)}")`;
+  // #"..." regex literals keep backslashes verbatim, so only a quote would break them.
+  if (p.includes('"')) throw new Error(`pi-sandbox: glob must not contain '"': ${p}`);
+  return `(regex #"${globToSubtreeRegexSource(p)}")`;
 }
 
 export function buildSandboxExecProfile(config: SandboxConfig): string {
@@ -72,37 +81,14 @@ export function buildSandboxExecProfile(config: SandboxConfig): string {
     '(allow file-write* (path "/dev/autofs_nowait"))',
   ];
 
-  if (config.denyRead.length > 0) {
-    lines.push("; denied read paths");
-    for (const p of config.denyRead) {
-      const ep = escapeSbplPath(p);
-      lines.push(`(deny file-read* (literal "${ep}"))`);
-      lines.push(`(deny file-read* (subpath "${ep}"))`);
-    }
-  }
+  lines.push("; writable paths");
+  for (const p of config.writable) lines.push(`(allow file-write* ${sbplFilter(p)})`);
 
-  if (config.allowRead && config.allowRead.length > 0) {
-    lines.push("; allowRead exceptions");
-    for (const p of config.allowRead) {
-      const ep = escapeSbplPath(p);
-      lines.push(`(allow file-read* (literal "${ep}"))`);
-      lines.push(`(allow file-read* (subpath "${ep}"))`);
-    }
-  }
+  lines.push("; write-protected paths");
+  for (const p of config.denyWrite) lines.push(`(deny file-write* ${sbplFilter(p)})`);
 
-  if (!config.readOnly && config.writable.length > 0) {
-    lines.push("; writable paths");
-    lines.push("(allow file-write*");
-    for (const p of config.writable) {
-      lines.push(`  (subpath "${escapeSbplPath(p)}")`);
-    }
-    lines.push(")");
-  }
-
-  for (const p of config.denyWithin) {
-    const ep = escapeSbplPath(p);
-    lines.push(`(deny file-write* (subpath "${ep}"))`);
-  }
+  lines.push("; denied paths (last so they win)");
+  for (const p of config.deny) lines.push(`(deny file-read* file-write* ${sbplFilter(p)})`);
 
   lines.push(
     "; mach services — missing entries cause hangs",
@@ -119,7 +105,7 @@ export function buildSandboxExecProfile(config: SandboxConfig): string {
     "(allow sysctl-read)",
   );
 
-  if (config.network) {
+  if (config.allowNetwork) {
     lines.push(
       "; network access",
       "(allow network*)",
@@ -138,7 +124,6 @@ export function buildSandboxExecProfile(config: SandboxConfig): string {
 // Intentionally excludes /var — bind-mounting the entire tree (/var/log, /var/cache, /var/lib)
 // adds seconds of startup delay and significant memory pressure on many distros.
 // /var/run and /var/lock are symlinks to /run (already bound above).
-// Add /var or specific subpaths to writable in sandbox.json if needed.
 const SYSTEM_RO_BINDS = [
   "/usr",
   "/bin",
@@ -178,7 +163,7 @@ export function buildBwrapSetup(
 
   args.push("--unshare-all");
   args.push("--die-with-parent");
-  if (config.network) {
+  if (config.allowNetwork) {
     args.push("--share-net");
   }
 
@@ -194,20 +179,15 @@ export function buildBwrapSetup(
     }
   }
 
-  for (const p of config.writable) {
-    if (existsSync(p)) {
-      args.push(config.readOnly ? "--ro-bind" : "--bind", p, p);
-      bindMounted.add(stripTrailingSep(p));
-    }
+  // Globs are expanded against the current filesystem at exec time.
+  const expand = (list: string[]) => list.flatMap(expandGlob).filter((p) => existsSync(p));
+
+  for (const p of expand(config.writable)) {
+    args.push("--bind", p, p);
+    bindMounted.add(stripTrailingSep(p));
   }
 
-  if (config.readOnly) {
-    const readOnlyTmp = createReadOnlyDirOverlay();
-    cleanupDirs.push(readOnlyTmp.cleanupDir);
-    args.push("--ro-bind", readOnlyTmp.source, "/tmp");
-  } else {
-    args.push("--tmpfs", "/tmp");
-  }
+  args.push("--tmpfs", "/tmp");
 
   // always mount workspace as read-only if not already covered
   const ws = stripTrailingSep(pathResolve(workspaceDir));
@@ -216,34 +196,13 @@ export function buildBwrapSetup(
     bindMounted.add(ws);
   }
 
-  // denyWithin: ro-bind overlay on specific subpaths (order matters — later wins)
-  for (const p of config.denyWithin) {
-    if (existsSync(p)) {
-      args.push("--ro-bind", p, p);
-    }
+  // Order matters — later mounts shadow earlier ones, so deny overlays go last.
+  for (const p of expand(config.denyWrite)) {
+    args.push("--ro-bind", p, p);
   }
 
-  // allowRead binds before denyRead overlays so narrower deny mounts shadow broader allows.
-  // Skip paths already covered by a writable root — the existing --bind is sufficient for reads
-  // and a later --ro-bind would silently downgrade write access.
-  for (const p of (config.allowRead ?? [])) {
-    if (!existsSync(p)) continue;
-    const np = stripTrailingSep(p);
-    const coveredByWritable = config.writable.some((w) => {
-      const nw = stripTrailingSep(w);
-      return np === nw || np.startsWith(nw + "/");
-    });
-    if (!coveredByWritable) {
-      args.push("--ro-bind", p, p);
-      bindMounted.add(np);
-    }
-  }
-
-  for (const p of config.denyRead) {
-    if (!existsSync(p)) {
-      continue;
-    }
-    const overlay = createDenyReadOverlay(p);
+  for (const p of expand(config.deny)) {
+    const overlay = createDenyOverlay(p);
     cleanupDirs.push(overlay.cleanupDir);
     args.push("--ro-bind", overlay.source, p);
   }
@@ -264,8 +223,8 @@ export function buildBwrapSetup(
   };
 }
 
-function createDenyReadOverlay(targetPath: string): { source: string; cleanupDir: string } {
-  const cleanupDir = mkdtempSync(join(tmpdir(), "pi-sandbox-denyread-"));
+function createDenyOverlay(targetPath: string): { source: string; cleanupDir: string } {
+  const cleanupDir = mkdtempSync(join(tmpdir(), "pi-sandbox-deny-"));
   const stat = statSync(targetPath);
 
   if (stat.isDirectory()) {
@@ -279,14 +238,6 @@ function createDenyReadOverlay(targetPath: string): { source: string; cleanupDir
   writeFileSync(emptyFile, "");
   chmodSync(emptyFile, 0o000);
   return { source: emptyFile, cleanupDir };
-}
-
-function createReadOnlyDirOverlay(): { source: string; cleanupDir: string } {
-  const cleanupDir = mkdtempSync(join(tmpdir(), "pi-sandbox-readonly-"));
-  const dir = join(cleanupDir, "tmp");
-  mkdirSync(dir);
-  chmodSync(dir, 0o555);
-  return { source: dir, cleanupDir };
 }
 
 function isUnderBindRoot(target: string, roots: Set<string>): boolean {
@@ -423,20 +374,9 @@ function spawnSandboxedCommand(
 
 // ─── Provider factory ──────────────────────────────────────────────────────
 
-export const providers: Record<Exclude<SandboxProviderType, "auto">, SandboxProvider> = {
-  "sandbox-exec": new SandboxExecProvider(),
-  bubblewrap: new BubblewrapProvider(),
-  none: new NoopProvider(),
-};
+const PROVIDERS: SandboxProvider[] = [new SandboxExecProvider(), new BubblewrapProvider()];
+const NOOP = new NoopProvider();
 
-export function selectProvider(preferred?: SandboxProviderType): SandboxProvider {
-  if (preferred && preferred !== "auto") {
-    return providers[preferred];
-  }
-
-  for (const p of [providers["sandbox-exec"], providers["bubblewrap"]]) {
-    if (p.available()) return p;
-  }
-
-  return providers["none"];
+export function selectProvider(): SandboxProvider {
+  return PROVIDERS.find((p) => p.available()) ?? NOOP;
 }

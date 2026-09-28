@@ -14,6 +14,7 @@
     "config.ts",
     "providers.ts",
     "guard.ts",
+    "glob.ts",
     "types.ts",
     "*.test.ts",
     "README.md",

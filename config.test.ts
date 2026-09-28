@@ -1,175 +1,87 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { loadConfig, getProtectedConfigPaths, getRequiredWritablePaths, resolveEnabled, resolveReadOnly, resolveSandboxUserShell, computeEffectiveDenyRead } from "./config.ts";
-import { isPathAllowed, resolveRealPath } from "./guard.ts";
+import { homedir } from "node:os";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { buildConfig, findNetworkSource, findTildeWarnings, getConfigPaths, mergeFileConfigs } from "./config.ts";
+import { isPathWritable, resolveRealPath } from "./guard.ts";
 
-describe("resolveEnabled", () => {
-  it("defaults to enabled", () => {
-    assert.equal(resolveEnabled(undefined), true);
+describe("mergeFileConfigs", () => {
+  it("concatenates deny arrays in priority order", () => {
+    assert.deepEqual(mergeFileConfigs([{ deny: ["/a"] }, { deny: ["/b"] }]).deny, ["/a", "/b"]);
   });
 
-  it("accepts explicit booleans", () => {
-    assert.equal(resolveEnabled(true), true);
-    assert.equal(resolveEnabled(false), false);
-  });
-});
-
-describe("resolveReadOnly", () => {
-  it("defaults to false", () => {
-    assert.equal(resolveReadOnly(undefined), false);
-  });
-
-  it("accepts explicit booleans", () => {
-    assert.equal(resolveReadOnly(true), true);
-    assert.equal(resolveReadOnly(false), false);
+  it("uses the strictest allowNetwork (any false wins)", () => {
+    assert.equal(mergeFileConfigs([{ allowNetwork: false }, { allowNetwork: true }]).allowNetwork, false);
+    assert.equal(mergeFileConfigs([{ allowNetwork: true }, { allowNetwork: false }]).allowNetwork, false);
+    assert.equal(mergeFileConfigs([{ allowNetwork: true }, {}]).allowNetwork, true);
+    assert.equal(mergeFileConfigs([{}, {}]).allowNetwork, undefined);
   });
 });
 
-describe("resolveSandboxUserShell", () => {
-  it("defaults to false so user-typed ! commands run unsandboxed", () => {
-    assert.equal(resolveSandboxUserShell(undefined), false);
+describe("findNetworkSource", () => {
+  it("reports the file that decided allowNetwork", () => {
+    const files = [{}, { allowNetwork: true }, { allowNetwork: false }];
+    assert.equal(findNetworkSource(["/p", "/a", "/h"], files, false), "/h");
+    assert.equal(findNetworkSource(["/p", "/a", "/h"], files.slice(0, 2), true), "/a");
   });
 
-  it("accepts explicit booleans", () => {
-    assert.equal(resolveSandboxUserShell(true), true);
-    assert.equal(resolveSandboxUserShell(false), false);
-  });
-
-  it("falls back to false for invalid values", () => {
-    assert.equal(resolveSandboxUserShell("yes"), false);
-    assert.equal(resolveSandboxUserShell(1), false);
+  it("returns undefined when no file sets allowNetwork", () => {
+    assert.equal(findNetworkSource(["/p"], [{}], undefined), undefined);
   });
 });
 
-describe("loadConfig", () => {
-  it("always includes required Pi support paths in writable roots", () => {
-    const { config, pathResolver } = loadConfig("/workspace");
-    const requiredPaths = getRequiredWritablePaths(pathResolver);
+describe("getConfigPaths", () => {
+  it("lists the project config first", () => {
+    assert.equal(getConfigPaths("/workspace")[0], "/workspace/.pi/sandbox.json");
+  });
+});
 
-    for (const path of requiredPaths) {
-      const realPath = resolveRealPath(path);
-      assert.equal(
-        config.writable.includes(realPath),
-        true,
-        `expected required writable path ${realPath} to be present`,
-      );
+describe("buildConfig", () => {
+  const empty = {};
+
+  it("defaults allowNetwork to true", () => {
+    assert.equal(buildConfig(empty, "/workspace").allowNetwork, true);
+    assert.equal(buildConfig({ allowNetwork: false }, "/workspace").allowNetwork, false);
+  });
+
+  it("includes built-in writable roots (workspace, tmp, agent dir)", () => {
+    const config = buildConfig(empty, "/workspace");
+    assert.ok(config.writable.includes("/workspace"));
+    assert.ok(config.writable.includes(resolveRealPath(getAgentDir())));
+  });
+
+  it("merges user deny with the default deny list", () => {
+    const config = buildConfig({ deny: ["/extra"] }, "/workspace");
+    assert.ok(config.deny.includes(resolveRealPath(`${homedir()}/.ssh`)));
+    assert.ok(config.deny.includes("/extra"));
+  });
+
+  it("expands variables and keeps globs", () => {
+    const config = buildConfig({ deny: ["${WORKSPACE}/**/.env*", "${HOME}/secret"] }, "/workspace");
+    assert.ok(config.deny.includes("/workspace/**/.env*"));
+    assert.ok(config.deny.includes(resolveRealPath(`${homedir()}/secret`)));
+  });
+
+  it("treats ~ literally (workspace-relative)", () => {
+    const config = buildConfig({ deny: ["~/secret"] }, "/workspace");
+    assert.ok(config.deny.includes("/workspace/~/secret"));
+  });
+
+  it("resolves relative entries against the workspace", () => {
+    const config = buildConfig({ deny: ["secrets/*.key"] }, "/workspace");
+    assert.ok(config.deny.includes("/workspace/secrets/*.key"));
+  });
+
+  it("always write-protects sandbox config files", () => {
+    const config = buildConfig(empty, "/workspace");
+    for (const p of getConfigPaths("/workspace")) {
+      assert.equal(isPathWritable(resolveRealPath(p), config), false);
     }
   });
-
-  it("always protects Pi sandbox config paths", () => {
-    const { config } = loadConfig("/workspace");
-    assert.equal(config.enabled, true);
-    const protectedPaths = getProtectedConfigPaths();
-
-    for (const path of protectedPaths) {
-      const realPath = resolveRealPath(path);
-      assert.equal(
-        config.denyWithin.includes(realPath),
-        true,
-        `expected protected config path ${realPath} to be denied`,
-      );
-    }
-  });
-
-  it("keeps protected config paths denied even if parent directories are writable", () => {
-    const { config } = loadConfig("/workspace");
-    const protectedPaths = getProtectedConfigPaths();
-
-    for (const path of protectedPaths) {
-      const realPath = resolveRealPath(path);
-      assert.equal(config.denyWithin.includes(realPath), true);
-      assert.equal(isPathAllowed(realPath, config), false);
-    }
-  });
-
-  it("defaults denyRead to the resolved DEFAULT_DENY_READ paths", () => {
-    const { config } = loadConfig("/workspace");
-    assert.equal(config.denyRead.length > 0, true);
-    assert.equal(config.allowRead.length, 0);
-  });
-
-  it("defaults readOnly to false", () => {
-    const { config } = loadConfig("/workspace");
-    assert.equal(config.readOnly, false);
-  });
 });
 
-describe("computeEffectiveDenyRead", () => {
-  const defaults = ["/home/user/.ssh", "/home/user/.aws", "/etc/shadow"];
-
-  it("returns all defaults when no allowRead or denyRead", () => {
-    const { effectiveDenyRead, effectiveAllowRead, conflicts, inconsistentAllow } = computeEffectiveDenyRead([], [], defaults);
-    assert.deepEqual(effectiveDenyRead, defaults);
-    assert.deepEqual(effectiveAllowRead, []);
-    assert.deepEqual(conflicts, []);
-    assert.deepEqual(inconsistentAllow, []);
-  });
-
-  it("removes exact default path when covered by allowRead", () => {
-    const { effectiveDenyRead, effectiveAllowRead, inconsistentAllow } = computeEffectiveDenyRead([], ["/home/user/.ssh"], defaults);
-    assert.equal(effectiveDenyRead.includes("/home/user/.ssh"), false);
-    assert.equal(effectiveDenyRead.includes("/home/user/.aws"), true);
-    assert.equal(effectiveDenyRead.includes("/etc/shadow"), true);
-    assert.deepEqual(effectiveAllowRead, ["/home/user/.ssh"]);
-    assert.deepEqual(inconsistentAllow, []);
-  });
-
-  it("removes default child paths when parent is in allowRead", () => {
-    const defaultsWithChild = ["/home/user/.ssh", "/home/user/.ssh/id_rsa"];
-    const { effectiveDenyRead, effectiveAllowRead, inconsistentAllow } = computeEffectiveDenyRead([], ["/home/user/.ssh"], defaultsWithChild);
-    assert.equal(effectiveDenyRead.includes("/home/user/.ssh"), false);
-    assert.equal(effectiveDenyRead.includes("/home/user/.ssh/id_rsa"), false);
-    assert.deepEqual(effectiveAllowRead, ["/home/user/.ssh"]);
-    assert.deepEqual(inconsistentAllow, []);
-  });
-
-  it("merges user denyRead with filtered defaults", () => {
-    const { effectiveDenyRead } = computeEffectiveDenyRead(["/home/user/.config"], [], defaults);
-    assert.equal(effectiveDenyRead.includes("/home/user/.config"), true);
-    assert.equal(effectiveDenyRead.includes("/home/user/.ssh"), true);
-  });
-
-  it("detects conflict when same path is in allowRead and denyRead", () => {
-    const { effectiveDenyRead, effectiveAllowRead, conflicts } = computeEffectiveDenyRead(
-      ["/home/user/.ssh"],
-      ["/home/user/.ssh"],
-      defaults,
-    );
-    assert.deepEqual(conflicts, ["/home/user/.ssh"]);
-    assert.equal(effectiveDenyRead.includes("/home/user/.ssh"), true);
-    assert.equal(effectiveAllowRead.includes("/home/user/.ssh"), false);
-  });
-
-  it("no conflict when allowRead and denyRead have different paths", () => {
-    const { conflicts } = computeEffectiveDenyRead(["/home/user/.aws"], ["/home/user/.ssh"], defaults);
-    assert.deepEqual(conflicts, []);
-  });
-
-  it("detects conflict when denyRead is a parent of allowRead (allowRead is silently covered)", () => {
-    const { effectiveDenyRead, effectiveAllowRead, conflicts } = computeEffectiveDenyRead(
-      ["/home/user"],
-      ["/home/user/.ssh"],
-      [],
-    );
-    assert.deepEqual(conflicts, ["/home/user/.ssh"]);
-    assert.equal(effectiveDenyRead.includes("/home/user"), true);
-    assert.equal(effectiveAllowRead.includes("/home/user/.ssh"), false);
-  });
-
-  it("no conflict when allowRead is a parent of denyRead (intentional: allow broad, deny specific)", () => {
-    const { effectiveAllowRead, conflicts, inconsistentAllow } = computeEffectiveDenyRead(["/home/user/.ssh"], ["/home/user"], []);
-    assert.deepEqual(conflicts, []);
-    assert.deepEqual(inconsistentAllow, []);
-    assert.deepEqual(effectiveAllowRead, ["/home/user"]);
-  });
-
-  it("detects and removes allowRead entry that is a child of effectiveDenyRead", () => {
-    const { effectiveAllowRead, inconsistentAllow } = computeEffectiveDenyRead(
-      [],
-      ["/home/user/.ssh/config"],
-      ["/home/user/.ssh"],
-    );
-    assert.deepEqual(inconsistentAllow, ["/home/user/.ssh/config"]);
-    assert.deepEqual(effectiveAllowRead, []);
+describe("findTildeWarnings", () => {
+  it("warns on ~ entries only", () => {
+    assert.equal(findTildeWarnings({ deny: ["~/a", "~", "/x/~/y", "~foo"] }).length, 2);
   });
 });

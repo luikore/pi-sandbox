@@ -1,36 +1,28 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
 
-export interface SandboxConfig {
-  /** Global sandbox switch. When false, bash and file-tool guards run unsandboxed. Default: true. */
-  enabled: boolean;
-  /** When true, block all filesystem writes regardless of writable roots. */
-  readOnly?: boolean;
-  /** Paths explicitly allowed for reads, overriding defaultDenyRead entries. */
-  allowRead?: string[];
-  /** Paths explicitly denied for reads by built-in read-only file tools. */
-  denyRead: string[];
-  /** Directories the agent is allowed to write to. "${WORKSPACE}" expands to the project root. */
-  writable: string[];
-  /** Paths explicitly denied for writes, even inside writable directories (e.g. .git/hooks). */
-  denyWithin: string[];
+/** Shape of sandbox.json. */
+export interface SandboxFileConfig {
+  /** Paths/globs the agent can neither read nor write. Merged with the built-in default deny list. */
+  deny?: string[];
   /** Allow outbound network access. Default: true. */
-  network: boolean;
-  /** Force a specific provider: "auto" | "sandbox-exec" | "bubblewrap" | "none". Default: "auto". */
-  provider?: SandboxProviderType;
-  /**
-   * When true, user-typed `!`/`!!` shell commands are run inside the sandbox
-   * like the agent's bash tool. When false (default), user commands run with
-   * Pi's normal local shell backend and are not sandboxed, because they are
-   * explicitly issued by the human rather than the model.
-   */
-  sandboxUserShell?: boolean;
+  allowNetwork?: boolean;
 }
 
-export type SandboxProviderType = "auto" | "sandbox-exec" | "bubblewrap" | "none";
+/** Resolved runtime config. All paths are absolute (literal paths or globs). */
+export interface SandboxConfig {
+  deny: string[];
+  /** Built-in writable roots: workspace, tmp, Pi agent dir. */
+  writable: string[];
+  /** Internal write-protected paths (.git/hooks, sandbox.json files). */
+  denyWrite: string[];
+  allowNetwork: boolean;
+}
+
+export type SandboxProviderType = "sandbox-exec" | "bubblewrap" | "none";
 
 export interface SandboxProvider {
   /** Human-readable name for logging. */
-  readonly name: string;
+  readonly name: SandboxProviderType;
   /** Whether this provider is available on the current system. */
   available(): boolean;
   /**

@@ -6,7 +6,7 @@ This package overrides Pi's bash tool and applies an OS sandbox:
 - macOS: `sandbox-exec`
 - Linux: `bubblewrap`
 
-It also blocks in-process file mutations outside configured writable paths.
+It also blocks in-process file mutations outside the workspace, tmp and the Pi agent dir.
 
 ## Install
 
@@ -27,7 +27,7 @@ pi -e ./index.ts
 `pi-sandbox` adds two layers of protection:
 
 - It overrides Pi's `bash` tool and runs shell commands inside an OS sandbox.
-- It intercepts file tools and blocks writes outside configured writable roots. It can also block selected read paths for `read`, `grep`, `find`, and `ls`.
+- It intercepts file tools and blocks writes outside the writable roots and reads/writes of `deny` paths for `read`, `write`, `edit`, `grep`, `find`, and `ls`.
 
 Behavior depends on the platform:
 
@@ -37,69 +37,50 @@ Behavior depends on the platform:
 
 ## Configuration
 
-The extension reads `sandbox.json` from:
+The extension reads and merges `sandbox.json` from (the files actually read are logged at startup):
 
-- `$(pi agent dir)/sandbox.json`
-- `~/.pi/agent/sandbox.json`
+1. Project: `${WORKSPACE}/.pi/sandbox.json` (highest priority)
+2. Pi agent dir: `$PI_CODING_AGENT_DIR/sandbox.json`
+3. `~/.pi/agent/sandbox.json`
 
-Supported fields:
+> **Note:** `PI_CODING_AGENT_DIR` is an environment variable read by Pi itself (not by this extension).
+> It overrides Pi's global config directory, which defaults to `~/.pi/agent`. When it is unset, both
+> agent-dir entries above point to the same file, which is read once. See Pi's
+> [environment variables docs](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/environment-variables.md).
 
-- `enabled`: turn the extension on or off globally
-- `allowRead`: paths to opt out of the default read deny list (see below)
-- `denyRead`: additional paths to block for Pi's built-in read-only file tools
-- `writable`: directories Pi is allowed to modify
-- `denyWithin`: subpaths that stay blocked even if they are inside a writable directory
-- `network`: whether outbound network access is allowed
-- `provider`: `auto`, `sandbox-exec`, `bubblewrap`, or `none`
-- `sandboxUserShell`: also run user-typed `!`/`!!` commands inside the sandbox (default: `false`)
+Fields (all optional, unknown fields are an error):
 
-Example:
+- `deny`: paths/globs that can be neither read nor written. Merged with the built-in default deny list.
+- `allowNetwork`: allow outbound network access (default: `true`).
+
+Merge: `deny` lists from the built-in defaults and all files are concatenated; `allowNetwork` uses the strictest
+value — if any file sets `false`, network is blocked. The file that decided it is logged at startup.
+
+A project `.pi/sandbox.json` can therefore only tighten the sandbox, never loosen it.
 
 ```json
 {
-  "enabled": true,
-  "allowRead": ["${HOME}/.ssh"],
-  "denyRead": ["${HOME}/.config/my-secrets"],
-  "writable": ["${WORKSPACE}", "${TMP}"],
-  "denyWithin": ["${WORKSPACE}/.git/hooks"],
-  "network": true,
-  "provider": "auto",
-  "sandboxUserShell": false
+  "deny": ["${HOME}/.config/my-secrets", "${WORKSPACE}/**/.env*", "${HOME}/**/*.pem"],
+  "allowNetwork": true
 }
 ```
 
-Available path variables:
+Paths support `${WORKSPACE}`, `${HOME}`, `${TMP}`/`${TMPDIR}`; relative paths resolve against the workspace.
+`~` is **not** expanded (it can be a real directory name); entries starting with `~/` log a warning at startup.
+An entry matches the path itself and everything beneath it.
 
-- `${WORKSPACE}`: the current project directory
-- `${HOME}`: your home directory
-- `${TMP}` and `${TMPDIR}`: the system temporary directory
+Glob syntax: `*` (within a segment), `**` (any depth), `?`, `[abc]`/`[!abc]`, `{a,b}`. Dotfiles are matched.
+On Linux (bubblewrap), globs are expanded against the filesystem when each command starts, so files created
+later in the same command are not covered. On macOS, globs compile to `sandbox-exec` regex rules.
 
-By default, the extension allows writes to:
+Built-in defaults (always applied):
 
-- `${WORKSPACE}`
-- `${TMP}`
-- Pi agent dir
+- writable: `${WORKSPACE}`, `${TMP}`, Pi agent dir (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`)
+- deny: `${HOME}/.ssh`, `${HOME}/.aws`, `${HOME}/.gnupg`, `${HOME}/.config/gcloud`, `${HOME}/.netrc`, `${HOME}/.git-credentials`, `/etc/shadow`, `/etc/sudoers`
+- write-protected: `${WORKSPACE}/.git/hooks`, all `sandbox.json` files above
 
-By default, the extension blocks reads from the following sensitive paths:
-
-- `${HOME}/.ssh`
-- `${HOME}/.aws`
-- `${HOME}/.gnupg`
-- `${HOME}/.config/gcloud`
-- `${HOME}/.netrc`
-- `${HOME}/.git-credentials`
-- `/etc/shadow`
-- `/etc/sudoers`
-
-Use `allowRead` to unblock any of these for a specific project. If a path appears in both `allowRead` and `denyRead`, deny wins and a warning is logged.
-
-`--sandbox-readonly` is a quick way to disable all filesystem writes regardless of `writable`, while keeping read access governed by the existing deny policy.
-
-For recursive read tools like `grep` and `find`, pi-sandbox blocks starting from a parent path that would traverse into a denied subtree.
-
-And blocks writes to:
-
-- `${WORKSPACE}/.git/hooks`
+For `read`/`grep`/`find`/`ls`, a denied target path is blocked; results inside denied paths are removed from
+`grep`/`find`/`ls` output.
 
 ## Status Command
 
@@ -109,7 +90,7 @@ The extension registers a Pi command:
 /sandbox-status
 ```
 
-It shows the active provider, network mode, writable paths, and deny rules.
+It shows the loaded config files, active provider, network mode, writable roots and deny rules.
 
 Runtime controls:
 
@@ -121,19 +102,13 @@ Runtime controls:
 
 ### User-typed `!` commands
 
-By default, commands you type yourself with `!`/`!!` run through Pi's normal local
-shell backend and are **not** sandboxed — they are explicitly initiated by you, not
-the model. The agent's bash tool stays sandboxed either way.
-
-Set `sandboxUserShell: true` in `sandbox.json` (or pass `--sandbox-user-shell`) to
-route `!` commands through the sandbox as well.
+Commands you type yourself with `!`/`!!` always run through Pi's normal local shell
+backend and are **never** sandboxed — they are explicitly initiated by you, not the model.
 
 Startup flags:
 
 ```bash
 pi -e ./index.ts --sandbox
-pi -e ./index.ts --sandbox-readonly
-pi -e ./index.ts --sandbox-user-shell
 pi -e ./index.ts --no-sandbox
 ```
 

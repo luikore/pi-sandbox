@@ -6,278 +6,95 @@ import { join } from "node:path";
 import { buildBwrapSetup, buildSandboxExecProfile } from "./providers.ts";
 import type { SandboxConfig } from "./types.ts";
 
+const cfg = (c: Partial<SandboxConfig>): SandboxConfig => ({
+  deny: [],
+  writable: [],
+  denyWrite: [],
+  allowNetwork: true,
+  ...c,
+});
+
+function withTmp(fn: (dir: string) => void) {
+  const dir = mkdtempSync(join(tmpdir(), "pi-sandbox-test-"));
+  try {
+    fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function mountIndex(args: string[], flag: string, target: string): number {
+  return args.findIndex((_a, i) => args[i] === flag && args[i + 2] === target);
+}
+
 describe("buildSandboxExecProfile", () => {
-  it("adds denyRead rules to the sandbox-exec profile", () => {
-    const config: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: ["/etc/passwd", "/Users/test/.ssh"],
-      writable: ["/workspace"],
-      denyWithin: ["/workspace/.git/hooks"],
-      network: true,
-    };
-
-    const profile = buildSandboxExecProfile(config);
-
-    assert.match(profile, /\(deny file-read\* \(literal "\/etc\/passwd"\)\)/);
-    assert.match(profile, /\(deny file-read\* \(subpath "\/etc\/passwd"\)\)/);
-    assert.match(profile, /\(deny file-read\* \(literal "\/Users\/test\/\.ssh"\)\)/);
+  it("emits deny rules for literal paths after writable rules", () => {
+    const profile = buildSandboxExecProfile(cfg({ writable: ["/workspace"], deny: ["/workspace/secret"] }));
+    const allowIdx = profile.indexOf('(allow file-write* (subpath "/workspace"))');
+    const denyIdx = profile.indexOf('(deny file-read* file-write* (subpath "/workspace/secret"))');
+    assert.notEqual(allowIdx, -1);
+    assert.ok(denyIdx > allowIdx, "deny must come after writable so it wins");
   });
 
-  it("emits allowRead rules after denyRead rules", () => {
-    const config: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      allowRead: ["/Users/test/.ssh"],
-      denyRead: ["/Users/test/.ssh"],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-
-    const profile = buildSandboxExecProfile(config);
-    const denyIndex = profile.indexOf('(deny file-read* (subpath "/Users/test/.ssh"))');
-    const allowIndex = profile.indexOf('(allow file-read* (subpath "/Users/test/.ssh"))');
-    assert.notEqual(denyIndex, -1);
-    assert.notEqual(allowIndex, -1);
-    assert.ok(allowIndex > denyIndex, "allowRead rules must appear after denyRead rules");
+  it("emits regex rules for globs", () => {
+    const profile = buildSandboxExecProfile(cfg({ deny: ["/w/**/.env*"] }));
+    assert.ok(profile.includes('(deny file-read* file-write* (regex #"^/w/(.*/)?\\.env[^/]*(/.*)?$"))'), profile);
   });
 
-  it("does not emit writable paths when readOnly is true", () => {
-    const config: SandboxConfig = {
-      enabled: true,
-      readOnly: true,
-      denyRead: [],
-      writable: ["/workspace", "/tmp"],
-      denyWithin: [],
-      network: true,
-    };
+  it("emits denyWrite rules", () => {
+    const profile = buildSandboxExecProfile(cfg({ denyWrite: ["/w/.git/hooks"] }));
+    assert.match(profile, /\(deny file-write\* \(subpath "\/w\/\.git\/hooks"\)\)/);
+  });
 
-    const profile = buildSandboxExecProfile(config);
-
-    // The writable-paths (allow file-write*) block must not appear.
-    // Device-access (allow file-write*) lines for /dev/* are still present.
-    assert.doesNotMatch(profile, /; writable paths/);
-    assert.doesNotMatch(profile, /\(subpath "\/workspace"\)/);
-    assert.doesNotMatch(profile, /\(subpath "\/tmp"\)/);
+  it("toggles network", () => {
+    assert.match(buildSandboxExecProfile(cfg({})), /\(allow network\*\)/);
+    assert.doesNotMatch(buildSandboxExecProfile(cfg({ allowNetwork: false })), /\(allow network\*\)/);
   });
 });
 
 describe("buildBwrapSetup", () => {
-  it("overlays denyRead files and directories after normal binds", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    const secretDir = mkdtempSync(join(tmpdir(), "pi-sandbox-secret-dir-"));
-    try {
-      const secretFile = join(workspace, "secret.txt");
+  it("overlays denied files and directories after normal binds", () => {
+    withTmp((ws) => {
+      const secretFile = join(ws, "secret.txt");
+      const secretDir = join(ws, "secretdir");
       writeFileSync(secretFile, "secret");
-      mkdirSync(join(secretDir, "nested"));
-
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: false,
-        denyRead: [secretFile, secretDir],
-        writable: [workspace],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(workspace, config, workspace);
+      mkdirSync(secretDir);
+      const setup = buildBwrapSetup(ws, cfg({ writable: [ws], deny: [secretFile, secretDir] }), ws);
       try {
-        assert.ok(setup.args.length > 0, "expected non-empty args");
-        assert.ok(setup.args.includes("--unshare-all"), "expected --unshare-all flag");
-        const fileOverlayIndex = setup.args.findIndex(
-          (_arg, index) =>
-            setup.args[index] === "--ro-bind" &&
-            setup.args[index + 2] === secretFile,
-        );
-        const dirOverlayIndex = setup.args.findIndex(
-          (_arg, index) =>
-            setup.args[index] === "--ro-bind" &&
-            setup.args[index + 2] === secretDir,
-        );
-
-        assert.notEqual(fileOverlayIndex, -1);
-        assert.notEqual(dirOverlayIndex, -1);
-        const fileOverlaySource = setup.args[fileOverlayIndex + 1];
-        const dirOverlaySource = setup.args[dirOverlayIndex + 1];
-        assert.equal(statSync(fileOverlaySource).mode & 0o777, 0);
-        assert.equal(statSync(dirOverlaySource).mode & 0o777, 0);
-        assert.throws(() => readFileSync(fileOverlaySource, "utf8"));
-        assert.throws(() => readdirSync(dirOverlaySource));
-        assert.equal(setup.args.includes("--chdir"), true);
-        assert.equal(setup.args.includes("--"), false);
+        const bindIdx = mountIndex(setup.args, "--bind", ws);
+        const fileIdx = mountIndex(setup.args, "--ro-bind", secretFile);
+        const dirIdx = mountIndex(setup.args, "--ro-bind", secretDir);
+        assert.ok(bindIdx >= 0 && fileIdx > bindIdx && dirIdx > bindIdx);
+        assert.equal(statSync(setup.args[fileIdx + 1]).mode & 0o777, 0);
+        assert.throws(() => readFileSync(setup.args[fileIdx + 1], "utf8"));
+        assert.throws(() => readdirSync(setup.args[dirIdx + 1]));
       } finally {
         setup.cleanup();
       }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-      rmSync(secretDir, { recursive: true, force: true });
-    }
+    });
   });
 
-  it("does not emit --ro-bind for allowRead paths already covered by a writable root", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    try {
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: false,
-        allowRead: [workspace],
-        denyRead: [],
-        writable: [workspace],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(workspace, config, workspace);
+  it("expands deny globs against the filesystem", () => {
+    withTmp((ws) => {
+      mkdirSync(join(ws, "a", "b"), { recursive: true });
+      writeFileSync(join(ws, ".env"), "x");
+      writeFileSync(join(ws, "a", "b", ".env.local"), "x");
+      writeFileSync(join(ws, "a", "keep.txt"), "x");
+      const setup = buildBwrapSetup(ws, cfg({ writable: [ws], deny: [`${ws}/**/.env*`] }), ws);
       try {
-        const roBindIndex = setup.args.findIndex(
-          (_arg, index) => setup.args[index] === "--ro-bind" && setup.args[index + 2] === workspace,
-        );
-        const bindIndex = setup.args.findIndex(
-          (_arg, index) => setup.args[index] === "--bind" && setup.args[index + 2] === workspace,
-        );
-        assert.notEqual(bindIndex, -1, "expected --bind for writable path");
-        assert.equal(roBindIndex, -1, "expected no --ro-bind for allowRead path covered by writable");
+        assert.notEqual(mountIndex(setup.args, "--ro-bind", join(ws, ".env")), -1);
+        assert.notEqual(mountIndex(setup.args, "--ro-bind", join(ws, "a", "b", ".env.local")), -1);
+        assert.equal(mountIndex(setup.args, "--ro-bind", join(ws, "a", "keep.txt")), -1);
       } finally {
         setup.cleanup();
       }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
+    });
   });
 
-  it("resolves --chdir correctly when cwd is inside an allowRead directory", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    const roDir = mkdtempSync(join(tmpdir(), "pi-sandbox-ro-"));
-    const subDir = join(roDir, "sub");
-    mkdirSync(subDir);
-    try {
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: false,
-        allowRead: [roDir],
-        denyRead: [],
-        writable: [workspace],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(subDir, config, workspace);
-      try {
-        const chdirIndex = setup.args.indexOf("--chdir");
-        assert.notEqual(chdirIndex, -1);
-        assert.equal(setup.args[chdirIndex + 1], subDir);
-      } finally {
-        setup.cleanup();
-      }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-      rmSync(roDir, { recursive: true, force: true });
-    }
-  });
-
-  it("bind-mounts allowRead paths before denyRead overlays so deny shadows allow", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    const parentDir = mkdtempSync(join(tmpdir(), "pi-sandbox-parent-"));
-    const childDir = join(parentDir, "child");
-    mkdirSync(childDir);
-    try {
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: false,
-        allowRead: [parentDir],
-        denyRead: [childDir],
-        writable: [workspace],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(workspace, config, workspace);
-      try {
-        const allowBindIndex = setup.args.findIndex(
-          (_arg, index) => setup.args[index] === "--ro-bind" && setup.args[index + 2] === parentDir,
-        );
-        const denyOverlayIndex = setup.args.findIndex(
-          (_arg, index) => setup.args[index] === "--ro-bind" && setup.args[index + 2] === childDir,
-        );
-        assert.notEqual(allowBindIndex, -1, "expected allowRead bind for parent");
-        assert.notEqual(denyOverlayIndex, -1, "expected denyRead overlay for child");
-        assert.ok(allowBindIndex < denyOverlayIndex, "allowRead bind must appear before denyRead overlay so deny shadows allow");
-        const denyOverlaySource = setup.args[denyOverlayIndex + 1];
-        assert.equal(statSync(denyOverlaySource).mode & 0o777, 0);
-      } finally {
-        setup.cleanup();
-      }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-      rmSync(parentDir, { recursive: true, force: true });
-    }
-  });
-
-  it("mounts /tmp read-only in read-only mode", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    try {
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: true,
-        denyRead: [],
-        writable: [],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(workspace, config, workspace);
-      try {
-        const tmpOverlayIndex = setup.args.findIndex(
-          (_arg, index) => setup.args[index] === "--ro-bind" && setup.args[index + 2] === "/tmp",
-        );
-
-        assert.notEqual(tmpOverlayIndex, -1);
-        const tmpOverlaySource = setup.args[tmpOverlayIndex + 1];
-        assert.equal(statSync(tmpOverlaySource).mode & 0o777, 0o555);
-      } finally {
-        setup.cleanup();
-      }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-    }
-  });
-
-  it("mounts writable paths as --ro-bind when readOnly is true", () => {
-    const workspace = mkdtempSync(join(tmpdir(), "pi-sandbox-workspace-"));
-    const writableDir = mkdtempSync(join(tmpdir(), "pi-sandbox-writable-"));
-    try {
-      const config: SandboxConfig = {
-        enabled: true,
-        readOnly: true,
-        denyRead: [],
-        writable: [writableDir, workspace],
-        denyWithin: [],
-        network: true,
-      };
-
-      const setup = buildBwrapSetup(workspace, config, workspace);
-      try {
-        // Should NOT have --bind for writable paths
-        for (const p of [writableDir, workspace]) {
-          const bindIndex = setup.args.findIndex(
-            (_arg, index) => setup.args[index] === "--bind" && setup.args[index + 2] === p,
-          );
-          assert.equal(bindIndex, -1, `expected no --bind for ${p}`);
-        }
-        // Should have --ro-bind for writable paths
-        for (const p of [writableDir, workspace]) {
-          const roBindIndex = setup.args.findIndex(
-            (_arg, index) => setup.args[index] === "--ro-bind" && setup.args[index + 2] === p,
-          );
-          assert.notEqual(roBindIndex, -1, `expected --ro-bind for ${p}`);
-        }
-      } finally {
-        setup.cleanup();
-      }
-    } finally {
-      rmSync(workspace, { recursive: true, force: true });
-      rmSync(writableDir, { recursive: true, force: true });
-    }
+  it("toggles network", () => {
+    withTmp((ws) => {
+      assert.ok(buildBwrapSetup(ws, cfg({}), ws).args.includes("--share-net"));
+      assert.ok(!buildBwrapSetup(ws, cfg({ allowNetwork: false }), ws).args.includes("--share-net"));
+    });
   });
 });

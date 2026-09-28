@@ -3,57 +3,33 @@ import assert from "node:assert/strict";
 import { homedir } from "node:os";
 import {
   expandHomePath,
-  isPathAllowed,
-  isPathDenied,
+  filterSearchOutput,
+  findMatch,
   isPathReadable,
-  isPathSearchable,
+  isPathWritable,
   resolveToolPath,
   stripTrailingSep,
 } from "./guard.ts";
 import type { SandboxConfig } from "./types.ts";
 
+const base: SandboxConfig = {
+  deny: [],
+  writable: ["/workspace", "/tmp"],
+  denyWrite: ["/workspace/.git/hooks"],
+  allowNetwork: true,
+};
+
 describe("stripTrailingSep", () => {
-  it("removes a single trailing slash", () => {
-    assert.equal(stripTrailingSep("/foo/bar/"), "/foo/bar");
-  });
-
-  it("removes multiple trailing slashes", () => {
+  it("strips trailing slashes but preserves root", () => {
     assert.equal(stripTrailingSep("/foo/bar///"), "/foo/bar");
-  });
-
-  it("leaves paths without trailing slash unchanged", () => {
-    assert.equal(stripTrailingSep("/foo/bar"), "/foo/bar");
-  });
-
-  it("preserves root path as single slash", () => {
-    assert.equal(stripTrailingSep("/"), "/");
-  });
-
-  it("normalizes multiple root slashes to single slash", () => {
     assert.equal(stripTrailingSep("///"), "/");
-  });
-
-  it("handles empty string", () => {
     assert.equal(stripTrailingSep(""), "");
   });
 });
 
-describe("expandHomePath", () => {
-  it("expands bare tilde to the home directory", () => {
+describe("expandHomePath / resolveToolPath", () => {
+  it("expands tilde", () => {
     assert.equal(expandHomePath("~"), homedir());
-  });
-
-  it("expands home-relative paths", () => {
-    assert.equal(expandHomePath("~/file.txt"), `${homedir()}/file.txt`);
-  });
-
-  it("leaves non-home paths unchanged", () => {
-    assert.equal(expandHomePath("src/file.txt"), "src/file.txt");
-  });
-});
-
-describe("resolveToolPath", () => {
-  it("resolves tilde paths against the home directory", () => {
     assert.equal(resolveToolPath("/workspace", "~/file.txt"), `${homedir()}/file.txt`);
   });
 
@@ -62,260 +38,87 @@ describe("resolveToolPath", () => {
   });
 });
 
-describe("isPathAllowed", () => {
-  const config: SandboxConfig = {
-    enabled: true,
-    readOnly: false,
-    denyRead: [],
-    writable: ["/workspace", "/tmp"],
-    denyWithin: ["/workspace/.git/hooks"],
-    network: true,
-  };
-
-  it("allows writes within writable directories", () => {
-    assert.equal(isPathAllowed("/workspace/src/file.ts", config), true);
-    assert.equal(isPathAllowed("/workspace/package.json", config), true);
-    assert.equal(isPathAllowed("/tmp/build/output", config), true);
+describe("isPathWritable", () => {
+  it("allows writes within writable roots", () => {
+    assert.equal(isPathWritable("/workspace/src/file.ts", base), true);
+    assert.equal(isPathWritable("/workspace", base), true);
+    assert.equal(isPathWritable("/tmp/build/output", base), true);
   });
 
-  it("allows the writable directory path itself", () => {
-    assert.equal(isPathAllowed("/workspace", config), true);
-    assert.equal(isPathAllowed("/tmp", config), true);
+  it("blocks writes outside writable roots and sibling prefixes", () => {
+    assert.equal(isPathWritable("/etc/hosts", base), false);
+    assert.equal(isPathWritable("/workspace-other", base), false);
+    assert.equal(isPathWritable("/workspace/../etc/hosts", base), false);
   });
 
-  it("blocks writes outside writable directories", () => {
-    assert.equal(isPathAllowed("/etc/hosts", config), false);
-    assert.equal(isPathAllowed("/home/user/file", config), false);
+  it("blocks denyWrite paths", () => {
+    assert.equal(isPathWritable("/workspace/.git/hooks/pre-commit", base), false);
   });
 
-  it("blocks writes within denyWithin paths", () => {
-    assert.equal(isPathAllowed("/workspace/.git/hooks", config), false);
+  it("deny wins over writable", () => {
+    const c = { ...base, deny: ["/workspace/secret"] };
+    assert.equal(isPathWritable("/workspace/secret/x", c), false);
+  });
+});
+
+describe("isPathReadable", () => {
+  it("allows everything not denied", () => {
+    assert.equal(isPathReadable("/etc/hosts", base), true);
   });
 
-  it("blocks denyWithin children via startsWith", () => {
-    assert.equal(isPathAllowed("/workspace/.git/hooks/pre-commit", config), false);
-    assert.equal(isPathAllowed("/workspace/.git/hooks/post-checkout", config), false);
+  it("blocks literal deny and descendants", () => {
+    const c = { ...base, deny: ["/home/u/.ssh"] };
+    assert.equal(isPathReadable("/home/u/.ssh", c), false);
+    assert.equal(isPathReadable("/home/u/.ssh/id_rsa", c), false);
+    assert.equal(isPathReadable("/home/u/.sshx", c), true);
   });
 
-  it("denyWithin takes precedence over writable", () => {
-    assert.equal(isPathAllowed("/workspace/.git/hooks", config), false);
+  it("supports * and ** globs (including dotfiles)", () => {
+    const c = { ...base, deny: ["/workspace/**/.env*", "/home/u/*.pem"] };
+    assert.equal(isPathReadable("/workspace/.env", c), false);
+    assert.equal(isPathReadable("/workspace/a/b/.env.local", c), false);
+    assert.equal(isPathReadable("/workspace/env", c), true);
+    assert.equal(isPathReadable("/home/u/k.pem", c), false);
+    assert.equal(isPathReadable("/home/u/sub/k.pem", c), true);
   });
 
-  it("handles trailing slashes in config paths", () => {
-    const configWithSlashes: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace/", "/tmp/"],
-      denyWithin: ["/workspace/.git/hooks/"],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace/src/file.ts", configWithSlashes), true);
-    assert.equal(isPathAllowed("/workspace/.git/hooks/pre-commit", configWithSlashes), false);
-    assert.equal(isPathAllowed("/tmp/build", configWithSlashes), true);
+  it("supports ?, [] and {} globs", () => {
+    const c = { ...base, deny: ["/w/id_?sa", "/w/[ab].txt", "/w/*.{key,p12}"] };
+    assert.equal(isPathReadable("/w/id_rsa", c), false);
+    assert.equal(isPathReadable("/w/a.txt", c), false);
+    assert.equal(isPathReadable("/w/c.txt", c), true);
+    assert.equal(isPathReadable("/w/x.p12", c), false);
+    assert.equal(isPathReadable("/w/x.pem", c), true);
   });
 
-  it("handles trailing slashes in the checked path", () => {
-    assert.equal(isPathAllowed("/workspace/src/", config), true);
-    assert.equal(isPathAllowed("/tmp/", config), true);
+  it("glob matching a directory denies its subtree", () => {
+    const c = { ...base, deny: ["/home/*/.aws"] };
+    assert.equal(isPathReadable("/home/u/.aws/credentials", c), false);
   });
 
-  it("does not allow sibling paths that look like prefixes", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace", c), true);
-    assert.equal(isPathAllowed("/workspace-other", c), false);
+  it("findMatch reports the matching entry", () => {
+    assert.equal(findMatch("/w/a/.env", ["/x", "/w/**/.env"]), "/w/**/.env");
+  });
+});
+
+describe("filterSearchOutput", () => {
+  const c = { ...base, deny: ["/workspace/**/.env", "/workspace/secret"] };
+
+  it("filters find output", () => {
+    const { text, hidden } = filterSearchOutput("src/a.ts\n.env\nsecret/x\nb/.env", "/workspace", "find", c);
+    assert.equal(text, "src/a.ts");
+    assert.equal(hidden, 3);
   });
 
-  it("resolves .. traversal before checking", () => {
-    assert.equal(isPathAllowed("/workspace/../etc/hosts", config), false);
-    assert.equal(isPathAllowed("/workspace/sub/../file.ts", config), true);
+  it("filters grep output with and without context lines", () => {
+    const out = ["src/a.ts:1: ok", ".env:2: TOKEN=x", "secret/k-3- ctx", "src/b-1.ts:4: ok"].join("\n");
+    const { text, hidden } = filterSearchOutput(out, "/workspace", "grep", c);
+    assert.equal(text, "src/a.ts:1: ok\nsrc/b-1.ts:4: ok");
+    assert.equal(hidden, 2);
   });
 
-  it("normalizes .. in config writable paths", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace/../shared"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/shared/file.ts", c), true);
-    assert.equal(isPathAllowed("/workspace/file.ts", c), false);
-  });
-
-  it("normalizes internal double slashes in config paths", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace//src"],
-      denyWithin: ["/workspace//src/.git"],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace/src/file.ts", c), true);
-    assert.equal(isPathAllowed("/workspace/src/.git/config", c), false);
-  });
-
-  it("denies everything when writable is empty", () => {
-    const c: SandboxConfig = { enabled: true, readOnly: false, denyRead: [], writable: [], denyWithin: [], network: true };
-    assert.equal(isPathAllowed("/anything", c), false);
-  });
-
-  it("does not deny when denyWithin is empty", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace/src", c), true);
-  });
-
-  it("applies denyRead separately from write policy", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: ["/workspace/secrets", "/tmp/private.log"],
-      writable: ["/workspace"],
-      denyWithin: ["/workspace/.git/hooks"],
-      network: true,
-    };
-    assert.equal(isPathReadable("/tmp/log.txt", c), true);
-    assert.equal(isPathAllowed("/tmp/log.txt", c), false);
-    assert.equal(isPathReadable("/workspace/secrets/api-key.txt", c), false);
-    assert.equal(isPathDenied("/tmp/private.log", c.denyRead), true);
-  });
-
-  it("blocks grep/find roots that contain denied descendants", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [`${homedir()}/.ssh`, "/etc/passwd"],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathSearchable(homedir(), c), false);
-    assert.equal(isPathSearchable("/etc", c), false);
-    assert.equal(isPathSearchable("/workspace", c), true);
-  });
-
-  it("blocks grep/find from the filesystem root when denyRead is non-empty", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [`${homedir()}/.ssh`, "/etc/passwd"],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathSearchable("/", c), false);
-  });
-
-  it("allows grep/find from the filesystem root when nothing is denied", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      denyRead: [],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathSearchable("/", c), true);
-  });
-
-  it("allowRead child path wins over a broader denyRead (most-specific-wins)", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      allowRead: [`${homedir()}/.ssh/config`],
-      denyRead: [`${homedir()}/.ssh`],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathReadable(`${homedir()}/.ssh/config`, c), true);
-    assert.equal(isPathReadable(`${homedir()}/.ssh/id_rsa`, c), false);
-    assert.equal(isPathSearchable(`${homedir()}/.ssh/config`, c), true);
-    assert.equal(isPathSearchable(`${homedir()}/.ssh`, c), false);
-  });
-
-  it("narrow denyRead wins over a broader allowRead (most-specific-wins)", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      allowRead: [homedir()],
-      denyRead: [`${homedir()}/.ssh`],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathReadable(`${homedir()}/.ssh/id_rsa`, c), false);
-    assert.equal(isPathReadable(`${homedir()}/.bashrc`, c), true);
-    assert.equal(isPathSearchable(`${homedir()}/.ssh`, c), false);
-  });
-
-  it("isPathSearchable blocks broad allowRead root that contains a denied descendant", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      allowRead: [homedir()],
-      denyRead: [`${homedir()}/.ssh`],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathSearchable(homedir(), c), false);
-    assert.equal(isPathSearchable(`${homedir()}/.bashrc`, c), true);
-  });
-
-  it("allowRead without conflicts lets the allowed path through denyRead", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: false,
-      allowRead: [`${homedir()}/.ssh`],
-      denyRead: [],
-      writable: ["/workspace"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathReadable(`${homedir()}/.ssh/config`, c), true);
-    assert.equal(isPathSearchable(`${homedir()}/.ssh`, c), true);
-  });
-
-  it("blocks writes everywhere in read-only mode", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: true,
-      denyRead: [],
-      writable: [],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace/file.ts", c), false);
-    assert.equal(isPathAllowed("/tmp/output", c), false);
-  });
-
-  it("readOnly overrides writable roots (config-level readOnly)", () => {
-    const c: SandboxConfig = {
-      enabled: true,
-      readOnly: true,
-      denyRead: [],
-      writable: ["/workspace", "/tmp"],
-      denyWithin: [],
-      network: true,
-    };
-    assert.equal(isPathAllowed("/workspace/file.ts", c), false);
-    assert.equal(isPathAllowed("/tmp/output", c), false);
+  it("filters ls output", () => {
+    const { text } = filterSearchOutput("src/\n.env\nsecret/", "/workspace", "ls", c);
+    assert.equal(text, "src/");
   });
 });

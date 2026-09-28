@@ -2,12 +2,11 @@ import {
   type ExtensionAPI,
   createBashTool,
   createLocalBashOperations,
-  isToolCallEventType,
 } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
-import { loadConfig, isPathAllowed } from "./config.ts";
+import { loadConfig } from "./config.ts";
 import { selectProvider } from "./providers.ts";
-import { isPathReadable, isPathSearchable, resolveToolPath, resolveRealPath } from "./guard.ts";
+import { filterSearchOutput, findMatch, isPathWritable, resolveToolPath, resolveRealPath } from "./guard.ts";
 
 let _version = "unknown";
 try {
@@ -19,61 +18,28 @@ try {
   }
 }
 
-export function applyReadOnlyOverride(config: ReturnType<typeof loadConfig>["config"], readOnlyOverride: boolean | undefined) {
-  if (readOnlyOverride === undefined) {
-    return config;
-  }
-  return {
-    ...config,
-    readOnly: readOnlyOverride,
-  };
-}
-
 export function assertSandboxProviderAvailable(enabled: boolean, providerName: string): void {
   if (enabled && providerName === "none") {
     throw new Error("pi-sandbox: sandbox enabled but no supported OS sandbox provider is available");
   }
 }
 
-export function resolveStartupOverrides(
+export function resolveStartupOverride(
   forceSandbox: boolean,
   forceNoSandbox: boolean,
-  forceReadOnly: boolean,
-): {
-  runtimeEnabledOverride: boolean | undefined;
-  runtimeReadOnlyOverride: boolean | undefined;
-  warnings: string[];
-} {
-  let runtimeEnabledOverride: boolean | undefined;
-  let runtimeReadOnlyOverride: boolean | undefined;
-  const warnings: string[] = [];
-
+): { runtimeEnabledOverride: boolean | undefined; warnings: string[] } {
   if (forceSandbox && forceNoSandbox) {
-    warnings.push("[pi-sandbox] Both --sandbox and --no-sandbox were provided; --no-sandbox wins.");
-    runtimeEnabledOverride = false;
-  } else if (forceSandbox) {
-    runtimeEnabledOverride = true;
-  } else if (forceNoSandbox) {
-    runtimeEnabledOverride = false;
+    return {
+      runtimeEnabledOverride: false,
+      warnings: ["[pi-sandbox] Both --sandbox and --no-sandbox were provided; --no-sandbox wins."],
+    };
   }
-
-  if (forceReadOnly && forceNoSandbox) {
-    warnings.push("[pi-sandbox] --sandbox-readonly is ignored when --no-sandbox is set.");
-    runtimeReadOnlyOverride = false;
-  } else if (forceReadOnly) {
-    runtimeReadOnlyOverride = true;
-    runtimeEnabledOverride = true;
-  }
-
-  return { runtimeEnabledOverride, runtimeReadOnlyOverride, warnings };
+  return { runtimeEnabledOverride: forceSandbox ? true : forceNoSandbox ? false : undefined, warnings: [] };
 }
 
 export default function (pi: ExtensionAPI) {
   const workspaceDir = process.cwd();
   let runtimeEnabledOverride: boolean | undefined;
-  let runtimeReadOnlyOverride: boolean | undefined;
-  let runtimeUserShellOverride: boolean | undefined;
-  const warnedUnavailableProviders = new Set<string>();
 
   pi.registerFlag("sandbox", {
     description: "Enable pi-sandbox for this Pi process",
@@ -85,58 +51,17 @@ export default function (pi: ExtensionAPI) {
     type: "boolean",
     default: false,
   });
-  pi.registerFlag("sandbox-readonly", {
-    description: "Force pi-sandbox into read-only mode for this Pi process",
-    type: "boolean",
-    default: false,
-  });
-  pi.registerFlag("sandbox-user-shell", {
-    description: "Also sandbox user-typed !/!! shell commands for this Pi process",
-    type: "boolean",
-    default: false,
-  });
 
   function syncStartupOverrides() {
-    const resolved = resolveStartupOverrides(
-      pi.getFlag("sandbox") === true,
-      pi.getFlag("no-sandbox") === true,
-      pi.getFlag("sandbox-readonly") === true,
-    );
+    const resolved = resolveStartupOverride(pi.getFlag("sandbox") === true, pi.getFlag("no-sandbox") === true);
     runtimeEnabledOverride = resolved.runtimeEnabledOverride;
-    runtimeReadOnlyOverride = resolved.runtimeReadOnlyOverride;
-    runtimeUserShellOverride = pi.getFlag("sandbox-user-shell") === true ? true : undefined;
     for (const warning of resolved.warnings) {
       console.warn(warning);
     }
   }
 
   function getState() {
-    const { config } = loadConfig(workspaceDir);
-    const effectiveConfig = applyReadOnlyOverride(config, runtimeReadOnlyOverride);
-    const provider = selectProvider(effectiveConfig.provider);
-
-    if (effectiveConfig.provider && effectiveConfig.provider !== "auto" && !provider.available()) {
-      const warningKey = `${effectiveConfig.provider}:${workspaceDir}`;
-      if (!warnedUnavailableProviders.has(warningKey)) {
-        warnedUnavailableProviders.add(warningKey);
-        console.warn(
-          `[pi-sandbox] Forced provider "${effectiveConfig.provider}" is not available on this system. ` +
-            `Falling back to automatic detection. Set provider to "auto" to suppress this warning.`,
-        );
-      }
-    }
-
-    const activeProvider = provider.available() ? provider : selectProvider("auto");
-    const enabled = runtimeEnabledOverride ?? effectiveConfig.enabled;
-
-    return { config: effectiveConfig, activeProvider, enabled };
-  }
-
-  function writeBlockReason(action: string, targetPath: string, config: ReturnType<typeof getState>["config"]): string {
-    if (config.readOnly) {
-      return `pi-sandbox: ${action} of "${targetPath}" blocked (sandbox is read-only)`;
-    }
-    return `pi-sandbox: ${action} of "${targetPath}" blocked (outside writable paths: ${config.writable.join(", ")})`;
+    return { config: loadConfig(workspaceDir).config, activeProvider: selectProvider(), enabled: runtimeEnabledOverride ?? true };
   }
 
   // ── Bash tool override ──────────────────────────────────────────────────
@@ -161,144 +86,68 @@ export default function (pi: ExtensionAPI) {
   // ── Path guard for in-process file tools (write, edit) ──────────────────
 
   pi.on("tool_call", async (event, ctx) => {
+    const { config, enabled } = getState();
+    if (!enabled) return;
     const cwd = ctx.cwd ?? workspaceDir;
-    const { config, enabled } = getState();
+    const abs = (p: string) => resolveRealPath(resolveToolPath(cwd, p));
+    const input = event.input as Record<string, string | undefined>;
 
-    if (!enabled) {
-      return;
-    }
-
-    if (isToolCallEventType("write", event)) {
-      const targetPath = event.input?.path;
-      if (targetPath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-        if (!isPathAllowed(absolute, config)) {
-          return {
-            block: true,
-            reason: writeBlockReason("write", targetPath, config),
-          };
-        }
-      }
-    }
-
-    if (isToolCallEventType("edit", event)) {
-      const targetPath = event.input?.path;
-      if (targetPath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-        if (!isPathAllowed(absolute, config)) {
-          return {
-            block: true,
-            reason: writeBlockReason("edit", targetPath, config),
-          };
-        }
-      }
-    }
-
-    // Future-proof guards for tools Pi doesn't ship yet.
-    // When Pi adds built-in delete/move tools, these handlers activate automatically.
-    if (isToolCallEventType("delete", event)) {
-      const targetPath = event.input?.path ?? event.input?.filePath;
-      if (targetPath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-        if (!isPathAllowed(absolute, config)) {
-          return {
-            block: true,
-            reason: writeBlockReason("delete", targetPath, config),
-          };
-        }
-      }
-    }
-
-    if (isToolCallEventType("move", event)) {
-      const sourcePath = event.input?.path ?? event.input?.source;
-      const destPath = event.input?.destination ?? event.input?.target;
-      if (sourcePath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, sourcePath));
-        if (!isPathAllowed(absolute, config)) {
-          return {
-            block: true,
-            reason: writeBlockReason("move from", sourcePath, config),
-          };
-        }
-      }
-      if (destPath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, destPath));
-        if (!isPathAllowed(absolute, config)) {
-          return {
-            block: true,
-            reason: writeBlockReason("move to", destPath, config),
-          };
-        }
-      }
-    }
-
-    if (isToolCallEventType("read", event)) {
-      const targetPath = event.input?.path;
-      if (targetPath) {
-        const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-        if (!isPathReadable(absolute, config)) {
-          return {
-            block: true,
-            reason: `pi-sandbox: read of "${targetPath}" blocked (matches denyRead: ${config.denyRead.join(", ")})`,
-          };
-        }
-      }
-    }
-
-    if (isToolCallEventType("grep", event)) {
-      const targetPath = event.input?.path ?? ".";
-      const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-      if (!isPathSearchable(absolute, config)) {
-        return {
-          block: true,
-          reason: `pi-sandbox: grep in "${targetPath}" blocked (matches denyRead: ${config.denyRead.join(", ")})`,
-        };
-      }
-    }
-
-    if (isToolCallEventType("find", event)) {
-      const targetPath = event.input?.path ?? ".";
-      const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-      if (!isPathSearchable(absolute, config)) {
-        return {
-          block: true,
-          reason: `pi-sandbox: find in "${targetPath}" blocked (matches denyRead: ${config.denyRead.join(", ")})`,
-        };
-      }
-    }
-
-    if (isToolCallEventType("ls", event)) {
-      const targetPath = event.input?.path ?? ".";
-      const absolute = resolveRealPath(resolveToolPath(cwd, targetPath));
-      if (!isPathReadable(absolute, config)) {
-        return {
-          block: true,
-          reason: `pi-sandbox: ls of "${targetPath}" blocked (matches denyRead: ${config.denyRead.join(", ")})`,
-        };
-      }
-    }
-  });
-
-  pi.on("session_start", async () => {
-    syncStartupOverrides();
-  });
-
-  // ── User bash guard (user-typed !commands) ──────────────────────────────
-
-  pi.on("user_bash", (_event, _ctx) => {
-    const { config, enabled } = getState();
-    const sandboxUserShell = runtimeUserShellOverride ?? config.sandboxUserShell ?? false;
-
-    // User-typed commands are trusted: unless sandboxUserShell is enabled, let
-    // Pi run them with its own local (unsandboxed) operations.
-    if (!enabled || !sandboxUserShell) {
-      return;
-    }
-
-    return {
-      operations: dynamicOps,
+    // Write-like tools. delete/move are future-proof guards for tools Pi doesn't ship yet.
+    const writeTargets: Record<string, [string, string | undefined][]> = {
+      write: [["write", input.path]],
+      edit: [["edit", input.path]],
+      delete: [["delete", input.path ?? input.filePath]],
+      move: [["move from", input.path ?? input.source], ["move to", input.destination ?? input.target]],
     };
+    for (const [action, target] of Object.hasOwn(writeTargets, event.toolName) ? writeTargets[event.toolName] : []) {
+      if (target && !isPathWritable(abs(target), config)) {
+        return { block: true, reason: `pi-sandbox: ${action} of "${target}" blocked (outside writable paths, or matches deny)` };
+      }
+    }
+
+    // Read-like tools. grep/find/ls results inside allowed roots are filtered in tool_result.
+    if (["read", "grep", "find", "ls"].includes(event.toolName)) {
+      const target = input.path ?? ".";
+      const denied = findMatch(abs(target), config.deny);
+      if (denied) {
+        return { block: true, reason: `pi-sandbox: ${event.toolName} of "${target}" blocked (matches deny: ${denied})` };
+      }
+    }
   });
+
+  pi.on("tool_result", async (event, ctx) => {
+    const tool = event.toolName;
+    if (tool !== "grep" && tool !== "find" && tool !== "ls") return;
+    const { config, enabled } = getState();
+    if (!enabled || event.isError) return;
+    const root = resolveRealPath(resolveToolPath(ctx.cwd ?? workspaceDir, (event.input.path as string | undefined) ?? "."));
+    let hiddenTotal = 0;
+    const content = event.content.map((c) => {
+      if (c.type !== "text") return c;
+      const { text, hidden } = filterSearchOutput(c.text, root, tool, config);
+      hiddenTotal += hidden;
+      return { ...c, text };
+    });
+    if (hiddenTotal === 0) return;
+    content.push({ type: "text", text: `[pi-sandbox: ${hiddenTotal} result(s) hidden (denied paths)]` });
+    return { content };
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    syncStartupOverrides();
+    const { config, sources, networkSource, warnings } = loadConfig(workspaceDir);
+    ctx.ui.notify(
+      [
+        `pi-sandbox: ${sources.length > 0 ? `loaded ${sources.join(", ")}` : "no sandbox.json found, using defaults"}`,
+        `pi-sandbox: network ${config.allowNetwork ? "allowed" : "blocked"} (${networkSource ?? "default"})`,
+      ].join("\n"),
+      "info",
+    );
+    for (const w of warnings) ctx.ui.notify(w, "warning");
+  });
+
+  // User-typed `!`/`!!` commands are never sandboxed: no user_bash handler, so Pi
+  // runs them with its normal local shell backend.
 
   // ── Command: show sandbox status ────────────────────────────────────────
 
@@ -306,36 +155,21 @@ export default function (pi: ExtensionAPI) {
     description: "Show pi-sandbox status and configuration",
     handler: async (_args, ctx) => {
       const { config, activeProvider, enabled } = getState();
+      const list = (items: string[]) => (items.length > 0 ? items.map((p) => `  - ${p}`) : ["  - none"]);
       const lines = [
         `pi-sandbox v${_version}`,
         `Enabled:      ${enabled ? "yes" : "no"}`,
-        `Override:     ${runtimeEnabledOverride === undefined ? "config" : runtimeEnabledOverride ? "enabled" : "disabled"}`,
-        `RO Override:  ${runtimeReadOnlyOverride === undefined ? "config" : runtimeReadOnlyOverride ? "enabled" : "disabled"}`,
+        `Override:     ${runtimeEnabledOverride === undefined ? "default" : runtimeEnabledOverride ? "enabled" : "disabled"}`,
         `Provider:     ${activeProvider.name}${enabled && activeProvider.name === "none" ? " (unavailable)" : ""}`,
-        `Read-only:    ${config.readOnly ? "yes" : "no"}`,
-        `Network:      ${config.network ? "allowed" : "blocked"}`,
-        `User shell:   ${(runtimeUserShellOverride ?? config.sandboxUserShell) ? "sandboxed" : "unsandboxed"}`,
-        `Writable:`,
-        ...(config.writable.length > 0 ? config.writable.map((p) => `  - ${p}`) : ["  - none"]),
+        `Network:      ${config.allowNetwork ? "allowed" : "blocked"}`,
+        `Config:       ${loadConfig(workspaceDir).sources.join(", ") || "none (defaults)"}`,
+        "Writable (built-in):",
+        ...list(config.writable),
+        "Deny (read+write):",
+        ...list(config.deny),
+        "Deny (write, built-in):",
+        ...list(config.denyWrite),
       ];
-      if (config.allowRead.length > 0) {
-        lines.push("Allow-read:");
-        for (const p of config.allowRead) {
-          lines.push(`  - ${p}`);
-        }
-      }
-      if (config.denyRead.length > 0) {
-        lines.push("Deny-read (effective):");
-        for (const p of config.denyRead) {
-          lines.push(`  - ${p}`);
-        }
-      }
-      if (config.denyWithin.length > 0) {
-        lines.push("Deny-within:");
-        for (const p of config.denyWithin) {
-          lines.push(`  - ${p}`);
-        }
-      }
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
@@ -365,8 +199,6 @@ export default function (pi: ExtensionAPI) {
     description: "Reset pi-sandbox runtime override and return to config-driven mode",
     handler: async (_args, ctx) => {
       runtimeEnabledOverride = undefined;
-      runtimeReadOnlyOverride = undefined;
-      runtimeUserShellOverride = undefined;
       syncStartupOverrides();
       ctx.ui.notify("pi-sandbox overrides cleared; using config again", "info");
     },
